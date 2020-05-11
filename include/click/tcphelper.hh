@@ -13,6 +13,7 @@
 #include <clicknet/ip.h>
 #include <click/element.hh>
 #include <functional>
+#include <click/hashmap.hh>
 
 
 #if HAVE_DPDK
@@ -236,7 +237,36 @@ public:
      */
     static int iterateOptions(Packet *packet, std::function<bool(uint8_t,void*)> fnt);
 
+    inline bool isDup(Packet* packet);
+
+private:
+    HashMap<uint64_t, uint32_t> conn_last_seq_;
 };
+
+static inline bool isNextTCPSequenceNumber(const uint32_t& x, const uint32_t& y) {
+    return (x > y) || (y-x > UINT32_MAX-0x10000 && x < y);
+}
+
+inline bool TCPHelper::isDup(Packet* packet) {
+    uint64_t key = static_cast<uint64_t>(getSourceAddress(packet)) << 32 | static_cast<uint64_t>(getSourcePort(packet));\
+    uint32_t seq = getSequenceNumber(packet);
+    auto pair = conn_last_seq_.find_pair(key);
+
+    if (pair == NULL) {
+        if (isSyn(packet)) {
+            conn_last_seq_.insert(key, seq);
+            return false;
+        }
+        return true;
+    }
+
+    if (isNextTCPSequenceNumber(seq, pair->value)) {
+        if (isFin(packet) || isRst(packet)) conn_last_seq_.erase(key);
+        return false;
+    }
+
+    return true;
+}
 
 inline tcp_seq_t
 TCPHelper::getNextSequenceNumber(Packet* packet) const

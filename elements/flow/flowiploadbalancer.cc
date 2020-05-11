@@ -95,14 +95,16 @@ void FlowIPLoadBalancer::push_batch(int, IPLBEntry* flowdata, PacketBatch* batch
         q->ip_header()->ip_dst = srv;
         p->set_dst_ip_anno(srv);
 	if (_track_load) {
-	    if (isSyn(p))
-                 _loads[b].connection_load++;
-	    else if (isFin(p) || isRst(p))
-                 _loads[b].connection_load--;
+	    if (isSyn(p) && !isDuo(p))
+            _loads[b].connection_load++;
+	    else if ((isFin(p) || isRst(p)) && !isDuo(p))
+            _loads[b].connection_load--;
 
-            _loads[b].packets_load++;
-            _loads[b].bytes_load += p->length();
-        }
+        nat_debug_chatter("ConnectionLoad for flow %d is %llu", b, _loads[b].connection_load);
+
+        _loads[b].packets_load++;
+        _loads[b].bytes_load += p->length();
+    }
 
 
         return true;
