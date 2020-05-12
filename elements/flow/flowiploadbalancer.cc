@@ -83,31 +83,86 @@ bool FlowIPLoadBalancer::new_flow(IPLBEntry* flowdata, Packet* p)
 
 void FlowIPLoadBalancer::push_batch(int, IPLBEntry* flowdata, PacketBatch* batch)
 {
-    auto fnt = [this,flowdata](Packet*&p) -> bool {
+    auto fnt = [this,flowdata,batch](Packet*&p) -> bool {
         WritablePacket* q =p->uniqueify();
         p = q;
 
-	unsigned b = flowdata->chosen_server;
+	    unsigned b = flowdata->chosen_server;
 
         nat_debug_chatter("Packet for flow %d", flowdata->chosen_server);
         IPAddress srv = _dsts[b];
 
         q->ip_header()->ip_dst = srv;
         p->set_dst_ip_anno(srv);
-	if (_track_load) {
-	    if (isSyn(p))
-                 _loads[b].connection_load++;
-	    else if (isFin(p) || isRst(p))
-                 _loads[b].connection_load--;
+
+        auto now = Clock::now();
+        if (_track_load) {
+            if (isSyn(p)) {
+                DurationSeconds d = now - _est_loads[b].conn_est.access;
+                _est_loads[b].conn_est.access = now;
+                _est_loads[b].conn_est.insert(d.count()*_loads[b].connection_load);
+                //click_chatter("sync %lf, %u, %lf, %llu", _est_loads[b].conn_est.sum, _est_loads[b].conn_est.buf.count(), d.count(), _loads[b].connection_load);
+                _loads[b].connection_load++;
+            }
+            else if (isFin(p) || isRst(p)) {
+                DurationSeconds d = now - _est_loads[b].conn_est.access;
+                _est_loads[b].conn_est.access = now;
+                _est_loads[b].conn_est.insert(d.count()*_loads[b].connection_load);
+                //click_chatter("fin %lf, %u, %lf, %llu", _est_loads[b].conn_est.sum, _est_loads[b].conn_est.buf.count(), d.count(), _loads[b].connection_load);
+                _loads[b].connection_load--;
+            }
 
             _loads[b].packets_load++;
             _loads[b].bytes_load += p->length();
+
+            /*
+            if (_loads[b].connection_load > 0 && _loads[b].connection_load < 65536) {
+                DurationSeconds d = now - _est_loads[b].conn_est.access;
+                if (d.count() > 1e-6) {
+                    _est_loads[b].tps_est.access = now;
+                    _est_loads[b].tps_est.insert(1/d.count()*batch->count()/_loads[b].connection_load);
+
+                    _est_loads[b].bw_est.access = now;
+                    _est_loads[b].bw_est.insert(p->length()/d.count()*batch->count()/_loads[b].connection_load);
+                    click_chatter("tps_est %lf, %u, %llu, %llu", _est_loads[b].tps_est.sum, _est_loads[b].tps_est.buf.count(), d.count(), _loads[b].connection_load);
+                    click_chatter("bw_est %lf, %u, %llu, %llu", _est_loads[b].bw_est.sum, _est_loads[b].bw_est.buf.count(), d.count(), _loads[b].connection_load);
+                }
+            }
+            */
         }
 
 
         return true;
     };
+
+    auto now = Clock::now();
+    auto last_loads = _loads;
+
     EXECUTE_FOR_EACH_PACKET_UNTIL_DROP(fnt, batch);
+
+    for (int b = 0; b < _dsts.size(); b++) {
+        uint64_t conn_load = (last_loads[b].connection_load +  _loads[b].connection_load) / 2;
+        if (conn_load > 0 && conn_load < 65536) {
+            DurationSeconds d = now - _est_loads[b].conn_est.access;
+            if (d.count() > 1e-6) {
+                _est_loads[b].tps_est.access = now;
+                _est_loads[b].tps_est.insert((_loads[b].packets_load-last_loads[b].packets_load)/d.count()*batch->count()/conn_load);
+
+                _est_loads[b].bw_est.access = now;
+                _est_loads[b].bw_est.insert((_loads[b].bytes_load-last_loads[b].bytes_load)/d.count()*batch->count()/conn_load);
+                //click_chatter("tps_est %lf, %u, %lf, %llu", _est_loads[b].tps_est.sum, _est_loads[b].tps_est.buf.count(), d.count(), conn_load);
+                //click_chatter("bw_est %lf, %u, %lf, %llu", _est_loads[b].bw_est.sum, _est_loads[b].bw_est.buf.count(), d.count(), conn_load);
+            }
+        }
+    }
+    /*
+    uint64_t sum = 0;
+    for (int i = 0; i < _dsts.size(); i++) {
+        if (_pre_loads[i].bytes_load < _loads[i].bytes_load) _pre_loads[i] = _loads[i];
+        sum = sum + _loads[i].bytes_load;
+    }
+    */
+    // for (int i = 0; i < _dsts.size(); i++) _pre_loads[i].bytes_load = _pre_loads[i].bytes_load * _loads[i].bytes_load / sum;
 
     if (batch)
         checked_output_push_batch(0, batch);

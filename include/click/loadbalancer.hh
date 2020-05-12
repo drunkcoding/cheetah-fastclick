@@ -6,14 +6,28 @@
 #include <algorithm>
 #include <click/dpdk_glue.hh>
 #include <click/hashtable.hh>
+#include <click/ring.hh>
 #include <click/multithread.hh>
 #include <click/args.hh>
 #include <click/straccum.hh>
+#include <chrono>
+#include <math.h>
+
+typedef std::chrono::steady_clock Clock;
+typedef std::chrono::steady_clock::time_point TimePoint;
+typedef std::chrono::duration<double> DurationSeconds;
+
+#define BUF_SIZE 0x1000
 
 class LoadBalancer { public:
 
     LoadBalancer() : _current(0),  _dsts(), _weights_helper(), _mode_case(round_robin) {
         modetrans.find_insert("rr",round_robin);
+        modetrans.find_insert("tr",training);
+        modetrans.find_insert("single",single_backend);
+        modetrans.find_insert("est_avg", average_estimation);
+        modetrans.find_insert("est_least", least_estimation);
+        modetrans.find_insert("est_stat", statistical_estimation);
         modetrans.find_insert("hash",direct_hash);
         modetrans.find_insert("hash_crc",direct_hash_crc);
         modetrans.find_insert("hash_agg",direct_hash_agg);
@@ -30,6 +44,11 @@ class LoadBalancer { public:
 
     enum LBMode {
         round_robin,
+        training,
+        single_backend,
+        average_estimation,
+        least_estimation,
+        statistical_estimation,
         weighted_round_robin,
         auto_weighted_round_robin,
         pow2,
@@ -41,7 +60,8 @@ class LoadBalancer { public:
     };
 
     static bool isLoadBased(LBMode mode) {
-        return mode == pow2 || mode == least_load || mode == weighted_round_robin  || mode == auto_weighted_round_robin;
+        return mode == pow2 || mode == least_load || mode == weighted_round_robin  || mode == auto_weighted_round_robin 
+        || mode == training || mode == average_estimation || mode == least_estimation || mode == statistical_estimation;
     }
 
     enum LSTMode {
@@ -66,6 +86,49 @@ class LoadBalancer { public:
         uint64_t cpu_load;
     } CLICK_CACHE_ALIGN;
 
+    // for numerical value estimation
+    template <typename T, size_t RING_SIZE = BUF_SIZE>
+    struct estimate_element {
+        estimate_element() {
+            access = Clock::now();
+            sum = 0;
+        }
+        void insert(T val) {
+            sum += val;
+            bool is_success = buf.insert(val);
+            if (!is_success) {
+                auto old_val = buf.extract();
+                buf.insert(val);
+                sum -= old_val;
+            }
+        }
+        T mean() { return (buf.count() == 0)? -1 : sum / buf.count(); }
+        T std() { 
+            if (buf.count() == 0) return -1;
+            T s = 0, m = mean();
+            for (int j = buf.tail; j < buf.head; j++) {
+                s += pow(buf.ring[j % RING_SIZE]-m,2);
+            }
+            return sqrt(s/buf.count());
+        }
+        Ring<T, RING_SIZE> buf;
+        TimePoint access;
+        T sum;
+    } CLICK_CACHE_ALIGN;
+
+    struct estimate {
+        estimate() {
+            pick_time = Clock::now();
+        }
+        estimate_element<double> bw_est;
+        estimate_element<double> tps_est;
+        estimate_element<double> conn_est;
+        Vector<double> cpu_hist;
+        TimePoint pick_time;
+    } CLICK_CACHE_ALIGN;
+
+    std::chrono::steady_clock::time_point _batch_time = std::chrono::steady_clock::now();
+
 
 protected:
     HashTable<String, LBMode> modetrans;
@@ -76,6 +139,9 @@ protected:
     LBMode _mode_case;
     LSTMode _lst_case;
     Vector <load,CLICK_CACHE_LINE_SIZE> _loads;
+    Vector <load,CLICK_CACHE_LINE_SIZE> _last_loads;
+    Vector <double> _pre_loads;
+    Vector <estimate> _est_loads;
     Vector <unsigned> _selector;
     Vector <unsigned> _cst_hash;
     Vector <unsigned> _spares;
@@ -178,7 +244,7 @@ protected:
         bool has_cst_buckets;
         int cst_buckets;
         int nserver;
-	bool force_track_load;
+        bool force_track_load;
         int ret = Args(lb, errh).bind(conf)
             .read_or_set("LB_MODE", lb_mode,"rr")
             .read_or_set("LST_MODE",lst_mode,"conn")
@@ -194,7 +260,7 @@ protected:
 
         _alpha = alpha;
         _autoscale = autoscale;
-	_force_track_load = force_track_load;
+        _force_track_load = force_track_load;
         if (has_cst_buckets) {
             _cst_hash.resize(cst_buckets, -1);
         }
@@ -254,61 +320,61 @@ protected:
             h_load,h_nb_total_servers,h_nb_active_servers,h_load_conn,h_load_packets,h_load_bytes,h_add_server,h_remove_server
     };
 
-    
- int lb_handler(int op, String &data, void *r_thunk, void* w_thunk, ErrorHandler *errh) {
-    
-    LoadBalancer *cs = this;
-    if (op == Handler::f_read) {
-        switch((uintptr_t) r_thunk) {
-           case h_load: {
-                StringAccum acc;
-		if (data) {
-		    int i = atoi(data.c_str());
-                    if (cs->_loads.size() <= i) {
-		        acc << "unknown";
-		    } else {
-		        acc << cs->_loads[i].cpu_load ;
-		    }
-		} else {
-		    for (int i = 0; i < cs->_dsts.size(); i ++) {
-			if (cs->_loads.size() <= i) {
-			    acc << "unknown";
-			} else {
-			    acc << cs->_loads[i].cpu_load ;
-			}
-			acc << (i == cs->_dsts.size() -1?"":" ");
-		    }
-		}
-                data = acc.take_string();
-		return 0;
-            }
-	}
-    } else {
-       switch((uintptr_t)w_thunk) {	
+
+    int lb_handler(int op, String &data, void *r_thunk, void* w_thunk, ErrorHandler *errh) {
+
+        LoadBalancer *cs = this;
+        if (op == Handler::f_read) {
+            switch((uintptr_t) r_thunk) {
             case h_load: {
-                String s(data);
-                //click_chatter("Input %s", s.c_str());
-                while (s.length() > 0) {
-                    int ntoken = s.find_left(',');
-                    if (ntoken < 0)
-                        ntoken = s.length() - 1;
-                    int pos = s.find_left(':');
-                    int server_id = atoi(s.substring(0,pos).c_str());
-                    int server_load = atoi(s.substring(pos + 1, ntoken).c_str());
-                    //click_chatter("%d is %d",server_id, server_load);
-                    if (cs->_loads.size() <= server_id) {
-                        click_chatter("Invalid server id %d", server_id);
-                        return 1;
+                    StringAccum acc;
+                    if (data) {
+                        int i = atoi(data.c_str());
+                        if (cs->_loads.size() <= i) {
+                            acc << "unknown";
+                        } else {
+                            acc << cs->_loads[i].cpu_load ;
+                        }
+                    } else {
+                        for (int i = 0; i < cs->_dsts.size(); i ++) {
+                            if (cs->_loads.size() <= i) {
+                                acc << "unknown";
+                            } else {
+                                acc << cs->_loads[i].cpu_load ;
+                            }
+                            acc << (i == cs->_dsts.size() -1?"":" ");
+                        }
                     }
-                    cs->_loads[server_id].cpu_load = server_load;
-                    s = s.substring(ntoken + 1);
+                    data = acc.take_string();
+                    return 0;
                 }
-                if (cs->_autoscale)
-	           cs->checkload();
-                return 0;
             }
-	}
-      }
+        } else {
+        switch((uintptr_t)w_thunk) {
+                case h_load: {
+                    String s(data);
+                    while (s.length() > 0) {
+                        int ntoken = s.find_left(',');
+                        if (ntoken < 0)
+                            ntoken = s.length() - 1;
+                        int pos = s.find_left(':');
+                        int server_id = atoi(s.substring(0,pos).c_str());
+                        int server_load = atoi(s.substring(pos + 1, ntoken).c_str());
+                        //click_chatter("%d is %d",server_id, server_load);
+                        if (cs->_loads.size() <= server_id) {
+                            click_chatter("Invalid server id %d", server_id);
+                            return 1;
+                        }
+                        cs->_est_loads[server_id].cpu_hist.push_back(server_load);
+                        cs->_loads[server_id].cpu_load = server_load;
+                        s = s.substring(ntoken + 1);
+                    }
+                    if (cs->_autoscale)
+                    cs->checkload();
+                    return 0;
+                }
+            }
+        }
     }
 
 
@@ -436,6 +502,15 @@ protected:
         _loads.resize(_dsts.size());
         CLICK_ASSERT_ALIGNED(_loads.data());
 
+        _last_loads.resize(_dsts.size());
+        CLICK_ASSERT_ALIGNED(_last_loads.data());
+
+        _est_loads.resize(_dsts.size());
+
+        _pre_loads.resize(_dsts.size());
+        for (int i = 0; i < _dsts.size(); i++) _pre_loads[i] = 0;
+        //CLICK_ASSERT_ALIGNED(_pre_loads.data());
+        // 
     }
 
     void set_weights(unsigned weigths_value[]) {
@@ -451,8 +526,246 @@ protected:
         _weights_helper.write_commit();
     }
 
+    inline double get_ARIMA(int sid, int n) {
+        auto& cpu_hist = _est_loads[sid].cpu_hist;
+        size_t obs_size = cpu_hist.size()-1;
+        size_t ar_size = 3, ma_size= 2;
+        double ma_params[ma_size] = {0.8399, 0.0213};
+        double ar_params[ar_size] = {1.0248, 0.4380, -0.4785};
+        double intercept = 22.7277;
+        Vector<double> win;
+        
+        for (size_t i = 1; i < cpu_hist.size(); i++) win.push_back(cpu_hist[i]-cpu_hist[i-1]);
+
+        // Initialize error values
+        Vector<double> errors;
+        for (int i = 0; i<2; i++) errors.push_back(0.0);
+
+        // Create whole window of values: observed + predicted
+        for (size_t i=0; i < n; i++) win.push_back(0.0);
+
+        // Make predictions when q > 0
+        for (size_t i=ar_size; i < win.size(); i++) {
+
+            double new_val = 0;
+            double error_now = 0;
+            double phi_factor = 1.0;
+
+            // Do the AR part
+            for (size_t j=0; j < ar_size; j++) {
+                new_val += ar_params[j] * win[i-1-j];
+                phi_factor -= ar_params[j];
+            }
+
+            // Do the MA part
+            for (unsigned int j=0; j < ma_size; j++)
+                new_val += ma_params[j] * errors[ma_size-1-j];
+
+            // Add intersect
+            new_val += intercept * phi_factor;
+
+            // Update predictions
+            if (i >= obs_size) {
+                win[i] = new_val;
+                error_now = 0;
+            } else {
+                error_now = win[i] - new_val;
+            }
+
+            // Update errors
+            for (size_t i=0; i < ma_size - 1; i++)
+                errors[i] = errors[i+1];
+
+            errors[ma_size-1] = error_now;
+        }
+
+        // Update prediction structure
+        return abs(win[win.size()-1]);
+    }
+
     inline int pick_server(const Packet* p) {
         switch(_mode_case) {
+            case single_backend : {
+                // for benchmarking purpose, only send to single backend
+                return 0;
+            }
+            case average_estimation: {
+                double avg_conn_bw = 0, avg_conn_time = 0, avg_conn_tps = 0;
+
+                std::function<bool(double,double)> comp = [&](double m,double n)-> bool {return m<n;};
+                auto result = std::min_element(std::begin(_pre_loads), std::end(_pre_loads),comp);
+                int sid = std::distance(std::begin(_pre_loads), result);
+                
+                for (auto& est : _est_loads) {
+                    avg_conn_bw += (est.bw_est.buf.count() == 0)? 0 : est.bw_est.sum / est.bw_est.buf.count();
+                    avg_conn_time += (est.conn_est.buf.count() == 0)? 0 : est.conn_est.sum / est.conn_est.buf.count();
+                    avg_conn_tps += (est.tps_est.buf.count() == 0)? 0 : est.tps_est.sum / est.tps_est.buf.count();
+                }
+                avg_conn_bw /= _est_loads.size();
+                avg_conn_time /= _est_loads.size();
+                avg_conn_tps /= _est_loads.size();
+
+                click_chatter("avg_conn_bw %lf, avg_conn_time %lf, avg_conn_tps %lf", avg_conn_bw,  avg_conn_time, avg_conn_tps);
+                for (int i = 0; i < _pre_loads.size(); i++)  click_chatter("%d _pre_loads %lf", i, _pre_loads[i]);
+
+                
+
+                switch(_lst_case) {
+                        case bytes: {
+                            _pre_loads[sid] = _pre_loads[sid] + avg_conn_bw*avg_conn_time;
+                            break;
+                        }
+                        case packets: {
+                            _pre_loads[sid] = _pre_loads[sid] + avg_conn_tps*avg_conn_time;
+                            break;
+                        }
+                        case connections: {
+                            _pre_loads[sid] = _pre_loads[sid] + avg_conn_time;
+                            break;
+                        }
+                        default:
+                            assert(false);
+                            break;
+                    }
+
+                return sid;
+            }
+            case least_estimation: {
+                double min_est = 1e100;
+                int idx = 0;
+                auto now = Clock::now();
+                for (int i = 0; i < _dsts.size(); i++) {
+                    DurationSeconds d = now - _est_loads[i].pick_time;
+                    double bw_est = (_loads[i].bytes_load-_last_loads[i].bytes_load)/d.count();
+                    double iops_est = (_loads[i].packets_load-_last_loads[i].packets_load)/d.count();
+                    double cpu_est = _loads[i].cpu_load * pow(0.995, d.count()*1000) 
+                        + (_loads[i].packets_load-_last_loads[i].packets_load) * 0.05;
+                    switch(_lst_case) {
+                        case bytes: {
+                            if (bw_est < min_est) {
+                                min_est = bw_est;
+                                idx = i;
+                            }
+                            break;
+                        }
+                        case packets: {
+                            if (iops_est < min_est) {
+                                min_est = iops_est;
+                                idx = i;
+                            }
+                            break;
+                        }
+                        case cpu: {
+                            if (cpu_est < min_est) {
+                                min_est = cpu_est;
+                                idx = i;
+                            }
+                            break;
+                        }
+                        default:
+                            if (iops_est*bw_est < min_est) {
+                                min_est = iops_est*bw_est;
+                                idx = i;
+                            }
+                            break;
+                    }
+                    _last_loads[i] = _loads[i];
+                    _est_loads[i].pick_time = now;
+                }
+
+                // click_chatter("%d min_est %lf", idx, min_est);
+                return idx;
+            }
+            case statistical_estimation: {
+                double min_est = 1e100;
+                int idx = 0;
+                double avg_conn_time = 0;
+                for (auto& est : _est_loads) {
+                    avg_conn_time += (est.conn_est.buf.count() == 0)? 0 : est.conn_est.sum / est.conn_est.buf.count();
+                }
+                avg_conn_time /= _est_loads.size();
+                int n = ceil(avg_conn_time*10);
+                for (int i = 0; i < _dsts.size(); i++) {
+                    auto& est = _est_loads[i];
+                    if (est.cpu_hist.size() < 10) {
+                        int b = _selector.unchecked_at((*_current)++);
+                        if (*_current == (unsigned)_selector.size()) {
+                            *_current = 0;
+                        }
+                        return b;
+                    }
+                    double pred = get_ARIMA(i,n);
+                    click_chatter("%d pred %lf, %d", i, pred, n);
+                    if (pred < min_est) {
+                        min_est = pred;
+                        idx = i;
+                    }
+                }
+                return idx;
+            }
+            /*
+            case least_estimation: {
+                double min_est = 1e100;
+                int idx = 0;
+                auto now = Clock::now();
+                for (int i = 0; i < _dsts.size(); i++) {
+                    DurationSeconds d = now - _est_loads[i].pick_time;
+                    // double bw_est = (_loads[i].bytes_load-_last_loads[i].bytes_load)/d.count();
+                    double avg_conn_bw = 0, avg_conn_time = 0;
+                    for (auto& est : _est_loads) {
+                        avg_conn_bw += (est.bw_est.buf.count() == 0)? 0 : est.bw_est.sum / est.bw_est.buf.count();
+                        avg_conn_time += (est.conn_est.buf.count() == 0)? 0 : est.conn_est.sum / est.conn_est.buf.count();
+                    }
+                    avg_conn_bw /= _est_loads.size();
+                    avg_conn_time /= _est_loads.size();
+                    double bw_est = 0, max_est = 0;
+                    for (int j = _est_loads[i].bw_est.buf.tail; j < _est_loads[i].bw_est.buf.head; j++) {
+                        bw_est = 0.35*bw_est + 0.65*_est_loads[i].bw_est.buf.ring[j % BUF_SIZE];
+                    }
+                    //for (int j = 0; j < int(avg_conn_time*100000); j++) {
+                    bw_est = 0.25*bw_est + 0.75*avg_conn_bw;
+                    //}
+
+                    double tps_est = (_est_loads[i].tps_est.buf.count() == 0)? 0 : _est_loads[i].tps_est.sum / _est_loads[i].tps_est.buf.count();
+                    double cpu_est = _loads[i].cpu_load * pow(0.995, d.count()*1000)
+                        + tps_est * d.count()
+                        + (_est_loads[i].conn_est.buf.count() == 0)? 0 : (_est_loads[i].conn_est.sum / _est_loads[i].conn_est.buf.count())*tps_est;
+                    click_chatter("bw_est %lf, tps_est %lf, cpu_est %lf", bw_est,  tps_est, cpu_est);
+                    switch(_lst_case) {
+                        case bytes: {
+                            if (bw_est < min_est) {
+                                min_est = bw_est;
+                                idx = i;
+                            }
+                            break;
+                        }
+                        case packets: {
+                            if (tps_est < min_est) {
+                                min_est = tps_est;
+                                idx = i;
+                            }
+                            break;
+                        }
+                        case cpu: {
+                            if (cpu_est < min_est) {
+                                min_est = cpu_est;
+                                idx = i;
+                            }
+                            break;
+                        }
+                        default:
+                            if (tps_est*bw_est < min_est) {
+                                min_est = tps_est*bw_est;
+                                idx = i;
+                            }
+                            break;
+                    }
+                }
+                _last_loads[idx] = _loads[idx];
+                if (_lst_case != cpu) _est_loads[idx].pick_time = now;
+                return idx;
+            }
+            */
             case round_robin: {
                 int b = _selector.unchecked_at((*_current)++);
                 if (*_current == (unsigned)_selector.size()) {
